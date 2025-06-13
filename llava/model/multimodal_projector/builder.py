@@ -37,7 +37,7 @@ from torch.nn.init import trunc_normal_
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-def build_matryoshka_query_transformer(config, delay_load=False, **kwargs):
+def build_matryoshka_query_transformer(config, delay_load=False, num_qformers=4, **kwargs):
     
     target_sequence_length = 256
     import math
@@ -51,6 +51,59 @@ def build_matryoshka_query_transformer(config, delay_load=False, **kwargs):
     )
     return resampler
 
+class MultiResampler(nn.Module):
+    """
+    experimental multi-resampler
+
+    Args:
+        num_resamplers:int = number of resamplers(qformers)
+
+    Outputs:
+        A tensor with the shape of (grid_size**2, embed_dim)
+    """
+
+    def __init__(
+            self,
+            grid_size,
+            embed_dim,
+            num_heads,
+            num_resamplers,
+            kv_dim=None,
+            norm_layer=partial(nn.LayerNorm, eps=1e-6),
+    ):
+        super().__init__()
+        self.resamplers = [Resampler(grid_size, embed_dim, num_heads, kv_dim, norm_layer) for _ in range(num_resamplers)]
+
+    def _init_weights(self, m):
+        for i in  range(len(self.resamplers)):
+            self.resamplers[i]._init_weights(m)
+
+    def forward(self, x, num_visual_tokens=256, tgt_size=(24,24), attn_mask=None):
+        pos_embed = get_abs_pos(self.pos_embed, tgt_size)
+
+        x = (x).permute(1, 0, 2)
+        
+        N = x.shape[1]
+
+        matry_n = get_matry_n(num_visual_tokens)
+        #print("number of visual tokens is:",matry_n)    
+        q = (self.query[:matry_n])
+    
+        q = self._repeat(q, N) 
+
+        out = self.attn(
+            self.ln_q(q + self.pos_embed[:matry_n].unsqueeze(1)),
+            self.ln_k(self._repeat(pos_embed, N)),
+            self.ln_v(x),
+            attn_mask=attn_mask)[0]
+
+        x = out.permute(1, 0, 2)
+
+        x = x @ self.proj
+        return x
+
+    def _repeat(self, query, N: int):
+        return query.unsqueeze(1).repeat(1, N, 1)
 
 def get_matry_n(num_visual_tokens):
     if num_visual_tokens == 'first_stage':
