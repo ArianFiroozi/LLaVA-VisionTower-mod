@@ -7,12 +7,14 @@ import time
 
 NUM_SECONDS_TO_SLEEP = 0.5
 
+# openai.api_key = "your key" 
 
+##########under 0.28.1 should be: 
 def get_eval(content: str, max_tokens: int):
     while True:
         try:
             response = openai.ChatCompletion.create(
-                model='gpt-4-0314',
+                model='gpt-4-0613',
                 messages=[{
                     'role': 'system',
                     'content': 'You are a helpful and precise assistant for checking the quality of the answer.'

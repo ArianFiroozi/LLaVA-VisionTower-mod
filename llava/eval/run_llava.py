@@ -116,6 +116,7 @@ def eval_model(args):
             input_ids,
             images=images_tensor,
             image_sizes=image_sizes,
+            num_visual_tokens=args.num_visual_tokens,
             do_sample=True if args.temperature > 0 else False,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -140,6 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--num-visual-tokens", type=int, default=256)
     args = parser.parse_args()
 
     eval_model(args)

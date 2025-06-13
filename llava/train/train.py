@@ -64,6 +64,11 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    
+    tune_mm_query_abstractor: bool = field(default=False)
+    pretrain_mm_query_abstractor: Optional[str] = field(default=None)
+    mm_query_abstractor_type: Optional[str] = field(default='matry_query')
+    num_visual_tokens: Optional[str] = field(default=None)
 
 
 @dataclass
@@ -205,7 +210,28 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
             else:
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         return
+    
+    if getattr(trainer.args, "tune_mm_query_abstractor", False):
+        # Only save Adapter
+        # keys_to_match = ['query_abstractor', 'query_tokens']
+        keys_to_match = ['query_abstractor']
+        if getattr(trainer.args, "use_im_start_end", False):
+            keys_to_match.extend(['embed_tokens', 'embed_in'])
 
+        weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
+        trainer.model.config.save_pretrained(output_dir)
+
+        current_folder = output_dir.split('/')[-1]
+        parent_folder = os.path.dirname(output_dir)
+        if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
+            if current_folder.startswith('checkpoint-'):
+                mm_projector_folder = os.path.join(parent_folder, "query_abstractor")
+                os.makedirs(mm_projector_folder, exist_ok=True)
+                torch.save(weight_to_save, os.path.join(mm_projector_folder, f'{current_folder}.bin'))
+            else:
+                torch.save(weight_to_save, os.path.join(output_dir, f'query_abstractor.bin'))
+        return
+    
     if trainer.deepspeed:
         torch.cuda.synchronize()
         trainer.save_model(output_dir)
@@ -655,6 +681,7 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -689,6 +716,29 @@ class LazySupervisedDataset(Dataset):
             length_list.append(cur_len)
         return length_list
 
+    @staticmethod
+    def _process_image(image_file, data_args, image_folder, resize=False):
+        processor = data_args.image_processor
+        image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+        if data_args.image_aspect_ratio == 'pad':
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                elif width > height:
+                    result = Image.new(pil_img.mode, (width, width), background_color)
+                    result.paste(pil_img, (0, (width - height) // 2))
+                    return result
+                else:
+                    result = Image.new(pil_img.mode, (height, height), background_color)
+                    result.paste(pil_img, ((height - width) // 2, 0))
+                    return result
+            image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        else:
+            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        return image
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
@@ -696,26 +746,15 @@ class LazySupervisedDataset(Dataset):
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
-            processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            if self.data_args.image_aspect_ratio == 'pad':
-                def expand2square(pil_img, background_color):
-                    width, height = pil_img.size
-                    if width == height:
-                        return pil_img
-                    elif width > height:
-                        result = Image.new(pil_img.mode, (width, width), background_color)
-                        result.paste(pil_img, (0, (width - height) // 2))
-                        return result
-                    else:
-                        result = Image.new(pil_img.mode, (height, height), background_color)
-                        result.paste(pil_img, ((height - width) // 2, 0))
-                        return result
-                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            if isinstance (image_file,list):
+                image = []
+                for img in image_file:
+                    img = self._process_image(img, self.data_args, self.data_args.image_folder)
+                    image.append(img)
+                image = torch.stack(image)
             else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                image = self._process_image(image_file, self.data_args, self.data_args.image_folder)
+           
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -924,10 +963,18 @@ def train(attn_implementation=None):
         model.config.tokenizer_model_max_length = tokenizer.model_max_length
 
         model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        model.config.tune_mm_query_abstractor = training_args.tune_mm_query_abstractor = model_args.tune_mm_query_abstractor
+        
+        model.config.num_visual_tokens = model_args.num_visual_tokens
         if model_args.tune_mm_mlp_adapter:
             model.requires_grad_(False)
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
+        if model_args.tune_mm_query_abstractor:
+            model.requires_grad_(False)
+            for p in model.get_model().query_abstractor.parameters():
+                p.requires_grad = True
+            #model.get_model().query_tokens.requires_grad = True
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:

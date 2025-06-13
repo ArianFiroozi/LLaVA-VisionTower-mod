@@ -19,12 +19,12 @@ import torch
 import torch.nn as nn
 
 from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_projector.builder import build_vision_projector
+from .multimodal_projector.builder import build_matryoshka_query_transformer
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 from llava.mm_utils import get_anyres_image_grid_shape
-
+import random 
 
 class LlavaMetaModel:
 
@@ -33,7 +33,7 @@ class LlavaMetaModel:
 
         if hasattr(config, "mm_vision_tower"):
             self.vision_tower = build_vision_tower(config, delay_load=True)
-            self.mm_projector = build_vision_projector(config)
+            self.query_abstractor = build_matryoshka_query_transformer(self.config)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
@@ -51,6 +51,7 @@ class LlavaMetaModel:
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        pretrain_mm_query_abstractor = model_args.pretrain_mm_query_abstractor
         mm_patch_merge_type = model_args.mm_patch_merge_type
 
         self.config.mm_vision_tower = vision_tower
@@ -71,31 +72,29 @@ class LlavaMetaModel:
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        self.config.query_abstractor_type = getattr(model_args, 'mm_query_abstractor_type', 'matry_query')
         self.config.mm_hidden_size = vision_tower.hidden_size
         self.config.mm_vision_select_layer = mm_vision_select_layer
         self.config.mm_vision_select_feature = mm_vision_select_feature
         self.config.mm_patch_merge_type = mm_patch_merge_type
 
         if getattr(self, 'mm_projector', None) is None:
-            self.mm_projector = build_vision_projector(self.config)
-
-            if 'unpad' in mm_patch_merge_type:
-                embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
-                self.image_newline = nn.Parameter(
-                    torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
-                )
-        else:
-            # In case it is frozen by LoRA
-            for p in self.mm_projector.parameters():
-                p.requires_grad = True
-
+            self.query_abstractor = build_matryoshka_query_transformer(self.config)
+            
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
-
+        
+        if pretrain_mm_query_abstractor is not None:
+            query_abstractor_weights = torch.load(pretrain_mm_query_abstractor, map_location='cpu')
+            def get_w(weights, keyword):
+                return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+            
+            self.query_abstractor.load_state_dict(get_w(query_abstractor_weights, 'query_abstractor'), strict=False)
+        
 
 def unpad_image(tensor, original_size):
     """
@@ -103,7 +102,7 @@ def unpad_image(tensor, original_size):
 
     Args:
     tensor (torch.Tensor): The image tensor, assumed to be in CxHxW format.
-    original_size (tuple): The original size of PIL image (width, height).
+    original_size (tuple): The original size of the image (height, width).
 
     Returns:
     torch.Tensor: The unpadded image tensor.
@@ -127,7 +126,6 @@ def unpad_image(tensor, original_size):
 
     return unpadded_tensor
 
-
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
@@ -137,14 +135,20 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
-    def encode_images(self, images):
+    def get_abstractor_attentions(self, images):
         image_features = self.get_model().get_vision_tower()(images)
-        image_features = self.get_model().mm_projector(image_features)
-        return image_features
+        outputs = self.get_model().query_abstractor(encoder_hidden_states=image_features, output_attentions=True)
+        return outputs.last_hidden_state, outputs.attentions
+
+    def encode_images(self, images, num_visual_tokens=256):
+        image_features = self.get_model().get_vision_tower()(images)
+        learned_query = self.get_model().query_abstractor(image_features, num_visual_tokens=num_visual_tokens)
+     
+        return learned_query 
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, image_sizes=None, num_visual_tokens=None,
     ):
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
@@ -152,15 +156,22 @@ class LlavaMetaForCausalLM(ABC):
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
+                print(len(images))
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
+        
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            if num_visual_tokens is None:
+                num_visual_tokens = getattr(self.config, 'num_visual_tokens', 256)
+            else: 
+                print('Inference with num_visual_tokens = ', num_visual_tokens)
+            image_features = self.encode_images(concat_images, num_visual_tokens=num_visual_tokens) 
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
-                image_features = [x.flatten(0, 1) for x in image_features]
+                image_features = [x.flatten(0, 1) for x in image_features] 
+    
             elif mm_patch_merge_type.startswith('spatial'):
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
@@ -199,7 +210,11 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            if num_visual_tokens is None:
+                num_visual_tokens = getattr(self.config, 'num_visual_tokens', 256)
+            else: 
+                print('Inference with num_visual_tokens = ', num_visual_tokens)
+            image_features = self.encode_images(images, num_visual_tokens=num_visual_tokens)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -231,6 +246,7 @@ class LlavaMetaForCausalLM(ABC):
         cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             num_images = (cur_input_ids == IMAGE_TOKEN_INDEX).sum()
+
             if num_images == 0:
                 cur_image_features = image_features[cur_image_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids)
@@ -250,14 +266,17 @@ class LlavaMetaForCausalLM(ABC):
             split_sizes = [x.shape[0] for x in cur_labels_noim]
             cur_input_embeds = self.get_model().embed_tokens(torch.cat(cur_input_ids_noim))
             cur_input_embeds_no_im = torch.split(cur_input_embeds, split_sizes, dim=0)
+  
             cur_new_input_embeds = []
             cur_new_labels = []
+            for i in range(num_images+1): 
 
-            for i in range(num_images + 1):
                 cur_new_input_embeds.append(cur_input_embeds_no_im[i])
                 cur_new_labels.append(cur_labels_noim[i])
+            
                 if i < num_images:
-                    cur_image_features = image_features[cur_image_idx]
+                    #print('i', i)
+                    cur_image_features =image_features[cur_image_idx] 
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
@@ -343,13 +362,26 @@ class LlavaMetaForCausalLM(ABC):
 
                 input_embeddings[-num_new_tokens:] = input_embeddings_avg
                 output_embeddings[-num_new_tokens:] = output_embeddings_avg
-
+            if model_args.tune_mm_query_abstractor:
+                for p in self.get_input_embeddings().parameters():
+                    p.requires_grad = True
+                for p in self.get_output_embeddings().parameters():
+                    p.requires_grad = False
             if model_args.tune_mm_mlp_adapter:
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = True
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
-
+            if model_args.pretrain_mm_query_abstractor:
+                query_abstractor_weights = torch.load(model_args.pretrain_mm_query_abstractor, map_location='cpu')
+                embed_tokens_weight = query_abstractor_weights['model.embed_tokens.weight']
+                assert num_new_tokens == 2
+                if input_embeddings.shape == embed_tokens_weight.shape:
+                    input_embeddings[-num_new_tokens:] = embed_tokens_weight[-num_new_tokens:]
+                elif embed_tokens_weight.shape[0] == num_new_tokens:
+                    input_embeddings[-num_new_tokens:] = embed_tokens_weight
+                else:
+                    raise ValueError(f"Unexpected embed_tokens_weight shape. Pretrained: {embed_tokens_weight.shape}. Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}.")
             if model_args.pretrain_mm_mlp_adapter:
                 mm_projector_weights = torch.load(model_args.pretrain_mm_mlp_adapter, map_location='cpu')
                 embed_tokens_weight = mm_projector_weights['model.embed_tokens.weight']
@@ -361,6 +393,8 @@ class LlavaMetaForCausalLM(ABC):
                 else:
                     raise ValueError(f"Unexpected embed_tokens_weight shape. Pretrained: {embed_tokens_weight.shape}. Current: {input_embeddings.shape}. Numer of new tokens: {num_new_tokens}.")
         elif model_args.mm_use_im_patch_token:
+            if model_args.tune_mm_query_abstractor:
+                raise NotImplementedError
             if model_args.tune_mm_mlp_adapter:
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = False
