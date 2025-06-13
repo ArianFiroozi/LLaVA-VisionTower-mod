@@ -141,8 +141,12 @@ class LlavaMetaForCausalLM(ABC):
         return outputs.last_hidden_state, outputs.attentions
 
     def encode_images(self, images, num_visual_tokens=256):
-        image_features = self.get_model().get_vision_tower()(images)
-        learned_query = self.get_model().query_abstractor(image_features, num_visual_tokens=num_visual_tokens)
+        features=[]
+        for image in images:
+            feat = self.get_model().get_vision_tower()(image)
+            features.append(feat)
+        # image_features = self.get_model().get_vision_tower()(images)
+        learned_query = self.get_model().query_abstractor(features, num_visual_tokens=num_visual_tokens)
      
         return learned_query 
 

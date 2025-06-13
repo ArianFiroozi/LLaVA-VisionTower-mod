@@ -79,29 +79,17 @@ class MultiResampler(nn.Module):
             self.resamplers[i]._init_weights(m)
 
     def forward(self, x, num_visual_tokens=256, tgt_size=(24,24), attn_mask=None):
-        raise NotImplementedError()
-        pos_embed = get_abs_pos(self.pos_embed, tgt_size)
-
-        x = (x).permute(1, 0, 2)
+        # raise NotImplementedError()
+        # x should be a list
+        assert len(x) == len(self.resamplers)
         
-        N = x.shape[1]
+        num_vt_each = num_visual_tokens//len(self.resamplers)
+        outs = []
+        for i in range(self.resamplers):
+            outs.append(self.resamplers[i].forward(x[i], num_vt_each, tgt_size))
+        concat = torch.cat(outs, dim=1)
+        return concat
 
-        matry_n = get_matry_n(num_visual_tokens)
-        #print("number of visual tokens is:",matry_n)    
-        q = (self.query[:matry_n])
-    
-        q = self._repeat(q, N) 
-
-        out = self.attn(
-            self.ln_q(q + self.pos_embed[:matry_n].unsqueeze(1)),
-            self.ln_k(self._repeat(pos_embed, N)),
-            self.ln_v(x),
-            attn_mask=attn_mask)[0]
-
-        x = out.permute(1, 0, 2)
-
-        x = x @ self.proj
-        return x
 
     def _repeat(self, query, N: int):
         raise NotImplementedError()
