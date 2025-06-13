@@ -79,6 +79,7 @@ class MultiResampler(nn.Module):
             self.resamplers[i]._init_weights(m)
 
     def forward(self, x, num_visual_tokens=256, tgt_size=(24,24), attn_mask=None):
+        raise NotImplementedError()
         pos_embed = get_abs_pos(self.pos_embed, tgt_size)
 
         x = (x).permute(1, 0, 2)
@@ -103,6 +104,7 @@ class MultiResampler(nn.Module):
         return x
 
     def _repeat(self, query, N: int):
+        raise NotImplementedError()
         return query.unsqueeze(1).repeat(1, N, 1)
 
 def get_matry_n(num_visual_tokens):
