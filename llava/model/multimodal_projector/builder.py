@@ -43,11 +43,12 @@ def build_matryoshka_query_transformer(config, delay_load=False, num_qformers=4,
     import math
     grid_size = int(math.sqrt(target_sequence_length))
     
-    resampler = Resampler(
+    resampler = MultiResampler(
         grid_size=grid_size,
         embed_dim =config.hidden_size,
         num_heads = 16,
         kv_dim=1024,
+        num_resamplers=4
     )
     return resampler
 
@@ -82,18 +83,13 @@ class MultiResampler(nn.Module):
         # raise NotImplementedError()
         # x should be a list
         assert len(x) == len(self.resamplers)
-        
+
         num_vt_each = num_visual_tokens//len(self.resamplers)
         outs = []
         for i in range(self.resamplers):
             outs.append(self.resamplers[i].forward(x[i], num_vt_each, tgt_size))
         concat = torch.cat(outs, dim=1)
         return concat
-
-
-    def _repeat(self, query, N: int):
-        raise NotImplementedError()
-        return query.unsqueeze(1).repeat(1, N, 1)
 
 def get_matry_n(num_visual_tokens):
     if num_visual_tokens == 'first_stage':
